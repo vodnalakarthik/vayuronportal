@@ -34,4 +34,4 @@ candidateSchema.index({ targetTitle: 1, location: 1 });
 candidateSchema.set('toJSON', { virtuals: true });
 candidateSchema.set('toObject', { virtuals: true });
 
-export const Candidate = mongoose.model('Candidate', candidateSchema);
+export const Candidate = mongoose.models.Candidate || mongoose.model('Candidate', candidateSchema);

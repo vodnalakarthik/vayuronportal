@@ -39,7 +39,11 @@ matchesRouter.post('/runs/:runId/cancel', async (req, res, next) => {
     }
 
     run.cancelRequested = true;
-    run.status = 'cancelling';
+    run.status = 'cancelled';
+    run.cancelledAt = new Date();
+    run.completedAt = new Date();
+    run.currentJobTitle = '';
+    run.error = undefined;
     await run.save();
 
     await recordAudit({

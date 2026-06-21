@@ -27,4 +27,4 @@ const resumeVersionSchema = new mongoose.Schema(
 resumeVersionSchema.index({ candidateId: 1, jobId: 1, version: -1 });
 resumeVersionSchema.index({ createdBy: 1, createdAt: -1 });
 
-export const ResumeVersion = mongoose.model('ResumeVersion', resumeVersionSchema);
+export const ResumeVersion = mongoose.models.ResumeVersion || mongoose.model('ResumeVersion', resumeVersionSchema);

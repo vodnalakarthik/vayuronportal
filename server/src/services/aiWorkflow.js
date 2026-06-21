@@ -5,7 +5,10 @@ import { Job } from '../modules/jobs/job.model.js';
 import { Application } from '../modules/applications/application.model.js';
 import { AiJobAnalysis } from '../modules/matches/ai-job-analysis.model.js';
 import { Match } from '../modules/matches/match.model.js';
+import { MatchRun } from '../modules/matches/match-run.model.js';
 import { ResumeVersion } from '../modules/resumes/resume-version.model.js';
+import { Candidate } from '../modules/candidates/candidate.model.js';
+import { recordAudit } from '../modules/audit/audit.service.js';
 
 const ANALYSIS_PROMPT_VERSION = 'vayuron-ai-match-v1';
 const RESUME_PROMPT_VERSION = 'vayuron-ai-resume-v2';
@@ -848,6 +851,226 @@ export async function runAiCandidateMatch({
     criteriaRequired: 3,
     finalLimit: MAX_FINAL_RESULTS
   };
+}
+
+export async function prepareCandidateMatchWorkflow({
+  runId,
+  candidateId,
+  days = 2,
+  dateScope = 'last2d',
+  titleKeywords = []
+}) {
+  requireAnthropicKey();
+  const currentRun = await MatchRun.findById(runId).select('cancelRequested').lean();
+  if (!currentRun || currentRun.cancelRequested) {
+    return {
+      jobs: [],
+      totalFetched: 0,
+      layer1Passed: 0,
+      layer1Discarded: 0,
+      days,
+      dateScope,
+      titleKeywords
+    };
+  }
+
+  const candidate = await Candidate.findById(candidateId).lean();
+  if (!candidate) throw httpError(404, 'Candidate not found.');
+
+  const plan = getAiMatchPlan({ candidate, days, dateScope, titleKeywords });
+  const appliedJobIds = await Application.find({ candidateId }).distinct('jobId');
+  const sourceQuery = appliedJobIds.length
+    ? { $and: [plan.query, { _id: { $nin: appliedJobIds } }] }
+    : plan.query;
+  const sourceJobs = await Job.find(sourceQuery).sort({ posted_at: -1, createdAt: -1 }).lean();
+  const preFiltered = preFilterAndScore(sourceJobs, candidate, PRE_FILTER_POOL_SIZE);
+  const jobs = preFiltered.jobs.map(({ rawJob, preFilter }, index) => ({
+    jobId: String(rawJob._id),
+    preFilter,
+    preFilterRank: index + 1
+  }));
+
+  await MatchRun.findByIdAndUpdate(runId, {
+    status: 'running',
+    startedAt: new Date(),
+    totalFetched: preFiltered.totalFetched,
+    layer1Passed: preFiltered.layer1Passed,
+    layer1Discarded: preFiltered.layer1Discarded,
+    preFilterPoolSize: jobs.length,
+    totalScanned: jobs.length,
+    days: plan.days,
+    dateScope: plan.dateScope,
+    titleKeywords: plan.titleKeywords,
+    currentJobTitle: ''
+  });
+
+  console.log(
+    `[pre-filter] ${preFiltered.totalFetched} fetched -> `
+    + `${preFiltered.layer1Passed} passed sponsorship -> `
+    + `${jobs.length} sent to Claude`
+  );
+
+  return {
+    jobs,
+    totalFetched: preFiltered.totalFetched,
+    layer1Passed: preFiltered.layer1Passed,
+    layer1Discarded: preFiltered.layer1Discarded,
+    days: plan.days,
+    dateScope: plan.dateScope,
+    titleKeywords: plan.titleKeywords
+  };
+}
+
+export async function processCandidateMatchWorkflowJob({
+  runId,
+  candidateId,
+  actor,
+  jobId,
+  preFilter,
+  preFilterRank
+}) {
+  const run = await MatchRun.findById(runId).select('cancelRequested processedJobIds').lean();
+  if (!run || run.cancelRequested) return { continue: false };
+  if (run.processedJobIds?.some((id) => String(id) === String(jobId))) return { continue: true };
+
+  const [candidate, rawJob] = await Promise.all([
+    Candidate.findById(candidateId).lean(),
+    Job.findById(jobId).lean()
+  ]);
+  if (!candidate || !rawJob) {
+    await MatchRun.findOneAndUpdate(
+      { _id: runId, processedJobIds: { $ne: jobId } },
+      {
+        $addToSet: { processedJobIds: jobId },
+        $inc: { processed: 1, failed: 1 },
+        $set: { error: !candidate ? 'Candidate no longer exists.' : 'Job no longer exists.' }
+      }
+    );
+    return { continue: Boolean(candidate) };
+  }
+
+  const job = normalizeJob(rawJob);
+  await MatchRun.findByIdAndUpdate(runId, { currentJobTitle: job.title });
+
+  let analysis;
+  let cached = 0;
+  let failed = 0;
+  let matched = 0;
+  let lastError = '';
+
+  try {
+    const cachedAnalysis = await AiJobAnalysis.findOne({
+      candidateId,
+      jobId,
+      candidateCacheKey: candidateCacheKey(candidate)
+    }).lean();
+
+    if (cachedAnalysis?.analysis) {
+      analysis = cachedAnalysis.analysis;
+      cached = 1;
+    } else {
+      analysis = await analyzeCandidateJob(candidate, rawJob);
+      await cacheAnalysis({ candidate, job: rawJob, analysis });
+    }
+
+    if (analysis.qualified) {
+      await saveMatchFromAnalysis({
+        candidate,
+        actor,
+        job: rawJob,
+        analysis,
+        preFilter,
+        preFilterRank
+      });
+      matched = 1;
+    }
+  } catch (error) {
+    failed = 1;
+    lastError = error.message;
+  }
+
+  const increments = { processed: 1 };
+  if (cached) increments.cached = cached;
+  if (failed) increments.failed = failed;
+  if (matched) increments.matched = matched;
+
+  await MatchRun.findOneAndUpdate(
+    { _id: runId, processedJobIds: { $ne: jobId } },
+    {
+      $addToSet: { processedJobIds: jobId },
+      $inc: increments,
+      $set: {
+        currentJobTitle: job.title,
+        ...(lastError ? { error: lastError } : {})
+      }
+    }
+  );
+
+  return { continue: true };
+}
+
+export async function finalizeCandidateMatchWorkflow({ runId, candidateId, actor, maxMatches = 0 }) {
+  const run = await MatchRun.findById(runId).lean();
+  if (!run) return;
+
+  const requestedMax = Number(maxMatches) > 0 ? Number(maxMatches) : MAX_FINAL_RESULTS;
+  const finalLimit = Math.min(MAX_FINAL_RESULTS, requestedMax);
+  const recommendationMatches = await Match.find({
+    candidateId,
+    status: { $ne: 'applied' }
+  })
+    .sort({ score: -1, preFilterScore: -1, matchedAt: -1 })
+    .select('_id')
+    .lean();
+  const staleMatchIds = recommendationMatches.slice(finalLimit).map((match) => match._id);
+
+  if (staleMatchIds.length) {
+    await Promise.all([
+      Match.deleteMany({ _id: { $in: staleMatchIds } }),
+      ResumeVersion.updateMany({ matchId: { $in: staleMatchIds } }, { $unset: { matchId: 1 } }),
+      Application.updateMany({ matchId: { $in: staleMatchIds } }, { $unset: { matchId: 1 } })
+    ]);
+  }
+
+  const cancelled = run.cancelRequested === true;
+  const completedAt = new Date();
+  await MatchRun.findByIdAndUpdate(runId, {
+    status: cancelled ? 'cancelled' : 'completed',
+    qualifiedByClaude: run.matched,
+    ...(cancelled ? { cancelledAt: completedAt } : {}),
+    completedAt,
+    currentJobTitle: ''
+  });
+
+  await recordAudit({
+    actor,
+    action: cancelled ? 'match.ai_run_cancelled' : 'match.ai_run',
+    entityType: 'candidate',
+    entityId: candidateId,
+    metadata: {
+      matches: run.matched,
+      totalScanned: run.totalScanned,
+      totalFetched: run.totalFetched,
+      layer1Passed: run.layer1Passed,
+      layer1Discarded: run.layer1Discarded,
+      preFilterPoolSize: run.preFilterPoolSize,
+      cancelled,
+      cached: run.cached,
+      days: run.days,
+      dateScope: run.dateScope,
+      titleKeywords: run.titleKeywords,
+      model: env.anthropicAnalysisModel
+    }
+  });
+}
+
+export async function failCandidateMatchWorkflow({ runId, error }) {
+  await MatchRun.findByIdAndUpdate(runId, {
+    status: 'failed',
+    error: error || 'The durable analysis workflow failed.',
+    completedAt: new Date(),
+    currentJobTitle: ''
+  });
 }
 
 function deriveWorkMode(jobDna = {}) {

@@ -26,4 +26,4 @@ const aiJobAnalysisSchema = new mongoose.Schema(
 
 aiJobAnalysisSchema.index({ candidateId: 1, jobId: 1, candidateCacheKey: 1 }, { unique: true });
 
-export const AiJobAnalysis = mongoose.model('AiJobAnalysis', aiJobAnalysisSchema);
+export const AiJobAnalysis = mongoose.models.AiJobAnalysis || mongoose.model('AiJobAnalysis', aiJobAnalysisSchema);

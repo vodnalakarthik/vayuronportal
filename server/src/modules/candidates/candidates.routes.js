@@ -1,4 +1,5 @@
 import express from 'express';
+import { start } from 'workflow/api';
 import { requireAuth, requireRole } from '../../shared/middleware/auth.js';
 import { recordAudit } from '../audit/audit.service.js';
 import { Application } from '../applications/application.model.js';
@@ -9,6 +10,7 @@ import { MatchRun } from '../matches/match-run.model.js';
 import { ResumeVersion } from '../resumes/resume-version.model.js';
 import { normalizeJob } from '../../services/jobNormalizer.js';
 import { generateTailoredResume, getAiMatchPlan, runAiCandidateMatch } from '../../services/aiWorkflow.js';
+import { candidateMatchWorkflow } from '../../../workflows/candidate-match.js';
 import {
   buildCandidateSearchQuery,
   cleanCandidatePayload,
@@ -231,102 +233,110 @@ candidatesRouter.post('/:id/match', async (req, res, next) => {
       email: req.user.email
     };
 
-    setImmediate(async () => {
-      try {
-        const startedRun = await MatchRun.findOneAndUpdate(
-          { _id: run._id, cancelRequested: { $ne: true } },
-          { status: 'running', startedAt: new Date() },
-          { new: true }
-        );
+    const workflowInput = {
+      runId: String(run._id),
+      candidateId: String(candidate._id),
+      actor,
+      days: plan.days,
+      dateScope: plan.dateScope,
+      maxMatches: Number(runOptions.maxMatches || 0),
+      titleKeywords: plan.titleKeywords
+    };
 
-        if (!startedRun) {
-          await MatchRun.findByIdAndUpdate(run._id, {
-            status: 'cancelled',
-            cancelledAt: new Date(),
-            completedAt: new Date(),
-            currentJobTitle: ''
+    if (process.env.VERCEL) {
+      await start(candidateMatchWorkflow, [workflowInput]);
+    } else {
+      setImmediate(async () => {
+        try {
+          const startedRun = await MatchRun.findOneAndUpdate(
+            { _id: run._id, cancelRequested: { $ne: true } },
+            { status: 'running', startedAt: new Date() },
+            { new: true }
+          );
+
+          if (!startedRun) return;
+
+          const result = await runAiCandidateMatch({
+            candidate,
+            actor,
+            days: workflowInput.days,
+            dateScope: workflowInput.dateScope,
+            maxMatches: workflowInput.maxMatches,
+            titleKeywords: workflowInput.titleKeywords,
+            shouldCancel: async () => {
+              const currentRun = await MatchRun.findById(run._id).select('cancelRequested').lean();
+              return currentRun?.cancelRequested === true;
+            },
+            onProgress: (progress) =>
+              MatchRun.findOneAndUpdate(
+                { _id: run._id, status: { $in: ['queued', 'running'] } },
+                {
+                  totalScanned: progress.totalScanned,
+                  totalFetched: progress.totalFetched,
+                  layer1Passed: progress.layer1Passed,
+                  layer1Discarded: progress.layer1Discarded,
+                  preFilterPoolSize: progress.preFilterPoolSize,
+                  processed: progress.processed,
+                  matched: progress.matched,
+                  cached: progress.cached,
+                  failed: progress.failed,
+                  days: progress.days ?? plan.days,
+                  dateScope: progress.dateScope || plan.dateScope,
+                  titleKeywords: progress.titleKeywords || workflowInput.titleKeywords,
+                  currentJobTitle: progress.currentJobTitle,
+                  ...(progress.lastError ? { error: progress.lastError } : {})
+                }
+              )
           });
-          return;
-        }
 
-        const result = await runAiCandidateMatch({
-          candidate,
-          actor,
-          days: runOptions.days,
-          dateScope: runOptions.dateScope,
-          maxMatches: runOptions.maxMatches,
-          titleKeywords: runOptions.titleKeywords,
-          shouldCancel: async () => {
-            const currentRun = await MatchRun.findById(run._id).select('cancelRequested').lean();
-            return currentRun?.cancelRequested === true;
-          },
-          onProgress: (progress) =>
-            MatchRun.findByIdAndUpdate(run._id, {
-              totalScanned: progress.totalScanned,
-              totalFetched: progress.totalFetched,
-              layer1Passed: progress.layer1Passed,
-              layer1Discarded: progress.layer1Discarded,
-              preFilterPoolSize: progress.preFilterPoolSize,
-              processed: progress.processed,
-              matched: progress.matched,
-              cached: progress.cached,
-              failed: progress.failed,
-              days: progress.days ?? plan.days,
-              dateScope: progress.dateScope || plan.dateScope,
-              titleKeywords: progress.titleKeywords || runOptions.titleKeywords,
-              currentJobTitle: progress.currentJobTitle,
-              ...(progress.lastError ? { error: progress.lastError } : {})
-            })
-        });
-
-        await MatchRun.findByIdAndUpdate(run._id, {
-          status: result.cancelled ? 'cancelled' : 'completed',
-          totalFetched: result.totalFetched,
-          layer1Passed: result.layer1Passed,
-          layer1Discarded: result.layer1Discarded,
-          preFilterPoolSize: result.preFilterPoolSize,
-          qualifiedByClaude: result.qualifiedByClaude,
-          totalScanned: result.totalScanned,
-          processed: result.processed,
-          matched: result.matches.length,
-          cached: result.cached,
-          days: result.days,
-          dateScope: result.dateScope,
-          titleKeywords: result.titleKeywords,
-          ...(result.cancelled ? { cancelledAt: new Date() } : {}),
-          completedAt: new Date(),
-          currentJobTitle: ''
-        });
-
-        await recordAudit({
-          actor,
-          action: result.cancelled ? 'match.ai_run_cancelled' : 'match.ai_run',
-          entityType: 'candidate',
-          entityId: candidate._id,
-          metadata: {
-            matches: result.matches.length,
-            totalScanned: result.totalScanned,
+          const currentRun = await MatchRun.findById(run._id).select('status cancelRequested').lean();
+          const cancelled = currentRun?.cancelRequested === true || currentRun?.status === 'cancelled' || result.cancelled;
+          await MatchRun.findByIdAndUpdate(run._id, {
+            status: cancelled ? 'cancelled' : 'completed',
             totalFetched: result.totalFetched,
             layer1Passed: result.layer1Passed,
             layer1Discarded: result.layer1Discarded,
             preFilterPoolSize: result.preFilterPoolSize,
             qualifiedByClaude: result.qualifiedByClaude,
-            cancelled: result.cancelled,
+            totalScanned: result.totalScanned,
+            processed: result.processed,
+            matched: result.matches.length,
             cached: result.cached,
             days: result.days,
             dateScope: result.dateScope,
             titleKeywords: result.titleKeywords,
-            model: result.aiModel
-          }
-        });
-      } catch (error) {
-        await MatchRun.findByIdAndUpdate(run._id, {
-          status: 'failed',
-          error: error.message,
-          completedAt: new Date()
-        });
-      }
-    });
+            ...(cancelled ? { cancelledAt: currentRun?.cancelledAt || new Date() } : {}),
+            completedAt: new Date(),
+            currentJobTitle: ''
+          });
+
+          await recordAudit({
+            actor,
+            action: cancelled ? 'match.ai_run_cancelled' : 'match.ai_run',
+            entityType: 'candidate',
+            entityId: candidate._id,
+            metadata: {
+              matches: result.matches.length,
+              totalScanned: result.totalScanned,
+              totalFetched: result.totalFetched,
+              cancelled,
+              cached: result.cached,
+              model: result.aiModel
+            }
+          });
+        } catch (error) {
+          await MatchRun.findOneAndUpdate(
+            { _id: run._id, status: { $ne: 'cancelled' } },
+            {
+              status: 'failed',
+              error: error.message,
+              completedAt: new Date(),
+              currentJobTitle: ''
+            }
+          );
+        }
+      });
+    }
 
     return res.status(202).json({ run: run.toObject(), matches: [], background: true });
   } catch (error) {

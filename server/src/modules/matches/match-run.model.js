@@ -24,6 +24,7 @@ const matchRunSchema = new mongoose.Schema(
     matched: { type: Number, default: 0 },
     cached: { type: Number, default: 0 },
     failed: { type: Number, default: 0 },
+    processedJobIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Job' }],
     currentJobTitle: String,
     error: String,
     startedAt: Date,
@@ -36,4 +37,4 @@ const matchRunSchema = new mongoose.Schema(
 matchRunSchema.index({ candidateId: 1, createdAt: -1 });
 matchRunSchema.index({ requestedBy: 1, createdAt: -1 });
 
-export const MatchRun = mongoose.model('MatchRun', matchRunSchema);
+export const MatchRun = mongoose.models.MatchRun || mongoose.model('MatchRun', matchRunSchema);

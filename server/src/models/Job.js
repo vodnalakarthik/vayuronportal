@@ -14,4 +14,4 @@ jobSchema.index({
   location: 'text'
 });
 
-export const Job = mongoose.model('Job', jobSchema, env.jobsCollection);
+export const Job = mongoose.models.Job || mongoose.model('Job', jobSchema, env.jobsCollection);
