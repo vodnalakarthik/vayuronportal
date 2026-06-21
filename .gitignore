@@ -1,5 +1,9 @@
 node_modules
 dist
+.nitro
+.output
+.workflow-data
+.vercel
 .env
 .env.*
 !.env.example

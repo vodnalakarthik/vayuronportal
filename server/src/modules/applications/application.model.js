@@ -34,4 +34,4 @@ applicationSchema.index({ candidateId: 1, jobId: 1 }, { unique: true });
 applicationSchema.index({ recruiterId: 1, status: 1, createdAt: -1 });
 applicationSchema.index({ createdAt: -1 });
 
-export const Application = mongoose.model('Application', applicationSchema);
+export const Application = mongoose.models.Application || mongoose.model('Application', applicationSchema);

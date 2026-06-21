@@ -45,4 +45,4 @@ matchSchema.index({ candidateId: 1, jobId: 1 }, { unique: true });
 matchSchema.index({ candidateId: 1, score: -1 });
 matchSchema.index({ requestedBy: 1, createdAt: -1 });
 
-export const Match = mongoose.model('Match', matchSchema);
+export const Match = mongoose.models.Match || mongoose.model('Match', matchSchema);
