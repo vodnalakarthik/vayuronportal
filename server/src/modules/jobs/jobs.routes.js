@@ -50,10 +50,20 @@ function dateFieldRange(fields, range) {
   if (!range) return null;
 
   return {
-    $or: fields.flatMap((field) => [
-      { [field]: { $gte: range.start, $lt: range.end } },
-      { [field]: { $gte: range.start.toISOString(), $lt: range.end.toISOString() } }
-    ])
+    $or: [
+      ...fields
+        .filter((field) => field !== 'job_posted_at_timestamp')
+        .flatMap((field) => [
+          { [field]: { $gte: range.start, $lt: range.end } },
+          { [field]: { $gte: range.start.toISOString(), $lt: range.end.toISOString() } }
+        ]),
+      {
+        job_posted_at_timestamp: {
+          $gte: range.start.getTime(),
+          $lt: range.end.getTime()
+        }
+      }
+    ]
   };
 }
 
@@ -62,16 +72,29 @@ function oldPostedJobsQuery(days = 7) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - safeDays);
   const cutoffIso = cutoff.toISOString();
-  const fields = ['postedAt', 'posted_at', 'datePosted', 'date_posted', 'publishedAt'];
+  const fields = [
+    'postedAt',
+    'posted_at',
+    'datePosted',
+    'date_posted',
+    'job_posted_at_datetime_utc',
+    'job_posted_at_timestamp',
+    'publishedAt'
+  ];
 
   return {
     days: safeDays,
     cutoff,
     query: {
-      $or: fields.flatMap((field) => [
-        { [field]: { $lt: cutoff } },
-        { [field]: { $lt: cutoffIso } }
-      ])
+      $or: [
+        ...fields
+          .filter((field) => field !== 'job_posted_at_timestamp')
+          .flatMap((field) => [
+            { [field]: { $lt: cutoff } },
+            { [field]: { $lt: cutoffIso } }
+          ]),
+        { job_posted_at_timestamp: { $lt: cutoff.getTime() } }
+      ]
     }
   };
 }
@@ -122,6 +145,51 @@ async function oldJobCleanupSummary(days) {
   };
 }
 
+async function allJobCleanupSummary() {
+  const allJobIds = await Job.distinct('_id');
+
+  if (!allJobIds.length) {
+    return {
+      allJobIds,
+      appliedJobIds: [],
+      nonAppliedJobIds: [],
+      counts: {
+        jobs: 0,
+        matches: 0,
+        analyses: 0,
+        resumeDraftsToDelete: 0,
+        applicationsPreserved: 0,
+        resumeVersionsPreserved: 0
+      }
+    };
+  }
+
+  const appliedJobIds = await Application.find({ jobId: { $in: allJobIds } }).distinct('jobId');
+  const appliedJobIdSet = new Set(appliedJobIds.map(String));
+  const nonAppliedJobIds = allJobIds.filter((jobId) => !appliedJobIdSet.has(String(jobId)));
+  const [matches, analyses, resumeDraftsToDelete, applicationsPreserved, resumeVersionsPreserved] = await Promise.all([
+    Match.countDocuments({ jobId: { $in: allJobIds } }),
+    AiJobAnalysis.countDocuments({ jobId: { $in: allJobIds } }),
+    nonAppliedJobIds.length ? ResumeVersion.countDocuments({ jobId: { $in: nonAppliedJobIds } }) : 0,
+    Application.countDocuments({ jobId: { $in: allJobIds } }),
+    appliedJobIds.length ? ResumeVersion.countDocuments({ jobId: { $in: appliedJobIds } }) : 0
+  ]);
+
+  return {
+    allJobIds,
+    appliedJobIds,
+    nonAppliedJobIds,
+    counts: {
+      jobs: allJobIds.length,
+      matches,
+      analyses,
+      resumeDraftsToDelete,
+      applicationsPreserved,
+      resumeVersionsPreserved
+    }
+  };
+}
+
 jobsRouter.get('/', async (req, res, next) => {
   try {
     const {
@@ -144,14 +212,17 @@ jobsRouter.get('/', async (req, res, next) => {
         $or: [
           { title: regex },
           { jobTitle: regex },
+          { job_title: regex },
           { position: regex },
           { company: regex },
           { companyName: regex },
           { company_name: regex },
+          { employer_name: regex },
           { organization: regex },
           { employer: regex },
           { description: regex },
           { jobDescription: regex },
+          { job_description: regex },
           { skills: regex },
           { required_skills: regex }
         ]
@@ -160,7 +231,7 @@ jobsRouter.get('/', async (req, res, next) => {
 
     if (title) {
       const regex = safeRegex(title);
-      and.push({ $or: [{ title: regex }, { jobTitle: regex }, { position: regex }, { role: regex }] });
+      and.push({ $or: [{ title: regex }, { jobTitle: regex }, { job_title: regex }, { position: regex }, { role: regex }] });
     }
 
     if (location) {
@@ -182,7 +253,18 @@ jobsRouter.get('/', async (req, res, next) => {
 
     if (postedWithin) {
       const postedRange = dateRangeForPreset(String(postedWithin));
-      const postedFilter = dateFieldRange(['postedAt', 'posted_at', 'datePosted', 'date_posted', 'publishedAt'], postedRange);
+      const postedFilter = dateFieldRange(
+        [
+          'postedAt',
+          'posted_at',
+          'datePosted',
+          'date_posted',
+          'job_posted_at_datetime_utc',
+          'job_posted_at_timestamp',
+          'publishedAt'
+        ],
+        postedRange
+      );
       if (postedFilter) and.push(postedFilter);
     }
 
@@ -233,11 +315,17 @@ jobsRouter.get('/', async (req, res, next) => {
 
 jobsRouter.get('/facets', async (_req, res, next) => {
   try {
-    const [locations, titles] = await Promise.all([Job.distinct('location'), Job.distinct('title')]);
+    const [locations, jobLocations, cities, titles, jobTitles] = await Promise.all([
+      Job.distinct('location'),
+      Job.distinct('job_location'),
+      Job.distinct('job_city'),
+      Job.distinct('title'),
+      Job.distinct('job_title')
+    ]);
 
     res.json({
-      locations: locations.filter(Boolean).slice(0, 200),
-      titles: titles.filter(Boolean).slice(0, 200)
+      locations: [...new Set([...locations, ...jobLocations, ...cities].filter(Boolean))].slice(0, 200),
+      titles: [...new Set([...titles, ...jobTitles].filter(Boolean))].slice(0, 200)
     });
   } catch (error) {
     next(error);
@@ -246,12 +334,14 @@ jobsRouter.get('/facets', async (_req, res, next) => {
 
 jobsRouter.get('/cleanup/preview', requireRole('admin'), async (req, res, next) => {
   try {
-    const summary = await oldJobCleanupSummary(req.query.days);
+    const deleteAll = req.query.scope === 'all';
+    const summary = deleteAll ? await allJobCleanupSummary() : await oldJobCleanupSummary(req.query.days);
     const activeRuns = await MatchRun.countDocuments({ status: { $in: ['queued', 'running', 'cancelling'] } });
 
     return res.json({
-      days: summary.days,
-      cutoff: summary.cutoff,
+      scope: deleteAll ? 'all' : 'old',
+      days: summary.days || null,
+      cutoff: summary.cutoff || null,
       activeRuns,
       ...summary.counts
     });
@@ -262,20 +352,24 @@ jobsRouter.get('/cleanup/preview', requireRole('admin'), async (req, res, next) 
 
 jobsRouter.delete('/cleanup', requireRole('admin'), async (req, res, next) => {
   try {
+    const deleteAll = req.query.scope === 'all';
     const activeRuns = await MatchRun.countDocuments({ status: { $in: ['queued', 'running', 'cancelling'] } });
     if (activeRuns) {
       return res.status(409).json({
-        message: `Wait for ${activeRuns} active job analysis run${activeRuns === 1 ? '' : 's'} to finish before deleting old jobs.`
+        message: `Wait for ${activeRuns} active job analysis run${activeRuns === 1 ? '' : 's'} to finish before deleting jobs.`
       });
     }
 
-    const summary = await oldJobCleanupSummary(req.query.days);
-    if (!summary.oldJobIds.length) {
+    const summary = deleteAll ? await allJobCleanupSummary() : await oldJobCleanupSummary(req.query.days);
+    const selectedJobIds = deleteAll ? summary.allJobIds : summary.oldJobIds;
+
+    if (!selectedJobIds.length) {
       return res.json({
-        days: summary.days,
-        cutoff: summary.cutoff,
+        scope: deleteAll ? 'all' : 'old',
+        days: summary.days || null,
+        cutoff: summary.cutoff || null,
         deleted: summary.counts,
-        message: 'No jobs older than the selected cutoff were found.'
+        message: deleteAll ? 'No jobs were found.' : 'No jobs older than the selected cutoff were found.'
       });
     }
 
@@ -283,15 +377,15 @@ jobsRouter.delete('/cleanup', requireRole('admin'), async (req, res, next) => {
     const nonAppliedJobIds = summary.nonAppliedJobIds || [];
 
     const [matches, analyses, resumeDrafts, jobs] = await Promise.all([
-      Match.deleteMany({ jobId: { $in: summary.oldJobIds } }),
-      AiJobAnalysis.deleteMany({ jobId: { $in: summary.oldJobIds } }),
+      Match.deleteMany({ jobId: { $in: selectedJobIds } }),
+      AiJobAnalysis.deleteMany({ jobId: { $in: selectedJobIds } }),
       nonAppliedJobIds.length ? ResumeVersion.deleteMany({ jobId: { $in: nonAppliedJobIds } }) : { deletedCount: 0 },
-      Job.deleteMany({ _id: { $in: summary.oldJobIds } })
+      Job.deleteMany({ _id: { $in: selectedJobIds } })
     ]);
 
     await Promise.all([
       Application.updateMany(
-        { jobId: { $in: summary.oldJobIds } },
+        { jobId: { $in: selectedJobIds } },
         { $unset: { matchId: 1 } }
       ),
       preservedJobIds.length
@@ -308,11 +402,12 @@ jobsRouter.delete('/cleanup', requireRole('admin'), async (req, res, next) => {
 
     await recordAudit({
       actor: req.user,
-      action: 'jobs.cleanup_old',
+      action: deleteAll ? 'jobs.cleanup_all' : 'jobs.cleanup_old',
       entityType: 'job',
       metadata: {
-        days: summary.days,
-        cutoff: summary.cutoff,
+        scope: deleteAll ? 'all' : 'old',
+        days: summary.days || null,
+        cutoff: summary.cutoff || null,
         deleted,
         applicationsPreserved: summary.counts.applicationsPreserved,
         resumeVersionsPreserved: summary.counts.resumeVersionsPreserved
@@ -320,8 +415,9 @@ jobsRouter.delete('/cleanup', requireRole('admin'), async (req, res, next) => {
     });
 
     return res.json({
-      days: summary.days,
-      cutoff: summary.cutoff,
+      scope: deleteAll ? 'all' : 'old',
+      days: summary.days || null,
+      cutoff: summary.cutoff || null,
       deleted,
       applicationsPreserved: summary.counts.applicationsPreserved,
       resumeVersionsPreserved: summary.counts.resumeVersionsPreserved

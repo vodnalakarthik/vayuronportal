@@ -435,6 +435,7 @@ function JobsPage({ isAdmin = false }) {
   const [page, setPage] = useState(1);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [cleaningOldJobs, setCleaningOldJobs] = useState(false);
+  const [cleaningAllJobs, setCleaningAllJobs] = useState(false);
   const [filters, setFilters] = useState({
     search: '',
     title: '',
@@ -478,7 +479,7 @@ function JobsPage({ isAdmin = false }) {
   }
 
   async function cleanupOldJobs() {
-    if (!isAdmin || cleaningOldJobs) return;
+    if (!isAdmin || cleaningOldJobs || cleaningAllJobs) return;
 
     setCleaningOldJobs(true);
     try {
@@ -521,6 +522,50 @@ function JobsPage({ isAdmin = false }) {
     }
   }
 
+  async function cleanupAllJobs() {
+    if (!isAdmin || cleaningAllJobs || cleaningOldJobs) return;
+
+    setCleaningAllJobs(true);
+    try {
+      const preview = await api('/jobs/cleanup/preview?scope=all');
+
+      if (preview.activeRuns) {
+        await showInfo(
+          'Job cleanup is temporarily unavailable',
+          `Wait for ${preview.activeRuns} active AI job analysis run${preview.activeRuns === 1 ? '' : 's'} to finish before deleting jobs.`
+        );
+        return;
+      }
+
+      if (!preview.jobs) {
+        await showInfo('No jobs found', 'The jobs database is already empty.');
+        return;
+      }
+
+      const confirmed = await confirmAction({
+        title: `Delete all ${preview.jobs.toLocaleString()} jobs?`,
+        text: `${preview.matches.toLocaleString()} matched-job records, ${preview.analyses.toLocaleString()} cached analyses, and ${preview.resumeDraftsToDelete.toLocaleString()} unapplied resume drafts will also be removed. ${preview.applicationsPreserved.toLocaleString()} applied-job records and ${preview.resumeVersionsPreserved.toLocaleString()} related resume versions will be preserved. This operation cannot be undone.`,
+        confirmText: 'Delete all jobs',
+        danger: true,
+        requireExplicit: true
+      });
+      if (!confirmed) return;
+
+      const result = await api('/jobs/cleanup?scope=all', { method: 'DELETE' });
+      setSelectedJob(null);
+      setPage(1);
+      setRefreshVersion((value) => value + 1);
+      await showSuccess(
+        'All jobs deleted',
+        `${result.deleted.jobs.toLocaleString()} jobs and ${result.deleted.matches.toLocaleString()} matched-job records were removed. ${result.applicationsPreserved.toLocaleString()} applied-job records were preserved.`
+      );
+    } catch (error) {
+      await showError('Delete-all cleanup failed', error.message || 'Unable to delete all jobs.');
+    } finally {
+      setCleaningAllJobs(false);
+    }
+  }
+
   return (
     <>
       <header className="page-header">
@@ -529,10 +574,24 @@ function JobsPage({ isAdmin = false }) {
           <p>{total.toLocaleString()} roles in the current database view</p>
         </div>
         {isAdmin ? (
-          <button className="secondary destructive-secondary" onClick={cleanupOldJobs} disabled={cleaningOldJobs}>
-            <Trash2 size={17} />
-            {cleaningOldJobs ? 'Checking old jobs' : 'Delete jobs older than 7 days'}
-          </button>
+          <div className="page-header-actions">
+            <button
+              className="secondary destructive-secondary"
+              onClick={cleanupOldJobs}
+              disabled={cleaningOldJobs || cleaningAllJobs}
+            >
+              <CalendarX2 size={17} />
+              {cleaningOldJobs ? 'Checking old jobs' : 'Delete jobs older than 7 days'}
+            </button>
+            <button
+              className="secondary destructive-secondary destructive-strong"
+              onClick={cleanupAllJobs}
+              disabled={cleaningAllJobs || cleaningOldJobs}
+            >
+              <Trash2 size={17} />
+              {cleaningAllJobs ? 'Checking all jobs' : 'Delete all jobs'}
+            </button>
+          </div>
         ) : null}
       </header>
 
