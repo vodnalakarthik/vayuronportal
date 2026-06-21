@@ -500,13 +500,27 @@ function postedDateQuery({ days = 2, dateScope = 'last2d' } = {}) {
   const start = new Date();
   start.setDate(start.getDate() - safeDays);
   const iso = start.toISOString();
-  const fields = ['postedAt', 'posted_at', 'datePosted', 'date_posted', 'publishedAt', 'ingested_at', 'ingestedAt', 'fetchedAt', 'createdAt'];
+  const fields = [
+    'postedAt',
+    'posted_at',
+    'datePosted',
+    'date_posted',
+    'job_posted_at_datetime_utc',
+    'publishedAt',
+    'ingested_at',
+    'ingestedAt',
+    'fetchedAt',
+    'createdAt'
+  ];
 
   return {
-    $or: fields.flatMap((field) => [
-      { [field]: { $gte: start } },
-      { [field]: { $gte: iso } }
-    ])
+    $or: [
+      ...fields.flatMap((field) => [
+        { [field]: { $gte: start } },
+        { [field]: { $gte: iso } }
+      ]),
+      { job_posted_at_timestamp: { $gte: start.getTime() } }
+    ]
   };
 }
 
@@ -531,7 +545,7 @@ function normalizeKeywords(keywords = []) {
 }
 
 function titleKeywordQuery(keywords) {
-  const fields = ['title', 'jobTitle', 'position', 'role', 'name'];
+  const fields = ['title', 'jobTitle', 'job_title', 'position', 'role', 'name'];
   const regexes = keywords.map((keyword) => new RegExp(escapeRegex(keyword), 'i'));
 
   return {

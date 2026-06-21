@@ -523,6 +523,20 @@ nav {
   color: #5d3708;
 }
 
+.page-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.destructive-strong {
+  border-color: #eaa097;
+  background: #fff4f2;
+  color: #8f1f16;
+}
+
 .search-box input,
 .inline-field input {
   border: 0;
