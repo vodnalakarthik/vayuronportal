@@ -10,30 +10,12 @@ import { ResumeVersion } from '../modules/resumes/resume-version.model.js';
 import { Candidate } from '../modules/candidates/candidate.model.js';
 import { recordAudit } from '../modules/audit/audit.service.js';
 
-const ANALYSIS_PROMPT_VERSION = 'vayuron-ai-match-v2';
+const ANALYSIS_PROMPT_VERSION = 'vayuron-ai-match-v1';
 const RESUME_PROMPT_VERSION = 'vayuron-ai-resume-v2';
 const PRE_FILTER_POOL_SIZE = 50;
 const MAX_FINAL_RESULTS = 35;
 const MIN_JD_SKILLS = 3;
 const NEUTRAL_PRE_FILTER_SCORE = 50;
-const MIN_DESCRIPTION_CHARACTERS = 500;
-const MIN_DESCRIPTION_WORDS = 80;
-const MIN_UNIQUE_DESCRIPTION_WORDS = 35;
-const MAX_OVERQUALIFIED_YEARS = 3;
-const MAX_UNDERQUALIFIED_YEARS = 2;
-
-const INVALID_DESCRIPTION_PATTERNS = [
-  /\b(?:job )?description (?:is )?(?:not available|unavailable|coming soon)\b/i,
-  /\bno (?:job )?description\b/i,
-  /\blorem ipsum\b/i,
-  /\bthis link is no longer valid\b/i,
-  /\bsession has expired due to inactivity\b/i,
-  /\bjob description\s*[-—]+\s*paste this into\b/i
-];
-
-const RESPONSIBILITY_TERMS = /\b(build|develop|design|implement|manage|lead|create|analy[sz]e|maintain|operate|architect|deliver|own|support|collaborate|optimi[sz]e|monitor|define|drive|execute|deploy|test|research)\w*\b/gi;
-const QUALIFICATION_TERMS = /\b(require[ds]?|qualification|proficien|experience with|years? of experience|degree|bachelor|master|ph\.?d|knowledge of|skills? in|expertise|familiarity)\b/gi;
-const JOB_STRUCTURE_TERMS = /\b(responsibilities|what you(?:'|’)ll do|what you will do|requirements|qualifications|about the role|minimum qualifications|preferred qualifications)\b/gi;
 
 const SPONSORSHIP_EXEMPT_AUTHORIZATIONS = [
   'us citizen',
@@ -239,59 +221,6 @@ export function extractAtsSkills(value) {
     .map((skill) => skill.name);
 }
 
-function descriptionWords(value) {
-  return normalizeSearchText(value).match(/[a-z][a-z0-9+#.-]*/g) || [];
-}
-
-function matchCount(value, pattern) {
-  return [...String(value || '').matchAll(pattern)].length;
-}
-
-export function assessJobDescriptionQuality(job) {
-  const normalized = normalizeJob(job);
-  const description = normalized.description.trim();
-  const words = descriptionWords(description);
-  const uniqueWords = new Set(words);
-  const placeholder = INVALID_DESCRIPTION_PATTERNS.find((pattern) => pattern.test(description));
-  const responsibilities = matchCount(description, RESPONSIBILITY_TERMS);
-  const qualifications = matchCount(description, QUALIFICATION_TERMS);
-  const structure = matchCount(description, JOB_STRUCTURE_TERMS);
-  const skills = extractAtsSkills(description).length;
-  const frequencies = words.reduce((counts, word) => {
-    counts.set(word, (counts.get(word) || 0) + 1);
-    return counts;
-  }, new Map());
-  const highestFrequency = Math.max(0, ...frequencies.values());
-  const repetitionRatio = words.length ? highestFrequency / words.length : 1;
-
-  let reason = '';
-  if (!description) reason = 'Job description is missing.';
-  else if (placeholder) reason = 'Job description contains placeholder or redirect-only text.';
-  else if (description.length < MIN_DESCRIPTION_CHARACTERS || words.length < MIN_DESCRIPTION_WORDS) {
-    reason = 'Job description is too short to verify responsibilities and qualifications.';
-  } else if (uniqueWords.size < MIN_UNIQUE_DESCRIPTION_WORDS || repetitionRatio > 0.18) {
-    reason = 'Job description has insufficient unique, meaningful content.';
-  } else if (responsibilities < 3) {
-    reason = 'Job description does not provide enough concrete role responsibilities.';
-  } else if (structure < 1 && qualifications < 2 && skills < MIN_JD_SKILLS && responsibilities < 5) {
-    reason = 'Job description lacks enough structured role-specific information.';
-  }
-
-  return {
-    pass: !reason,
-    reason: reason || null,
-    metrics: {
-      characters: description.length,
-      words: words.length,
-      uniqueWords: uniqueWords.size,
-      responsibilities,
-      qualifications,
-      structure,
-      skills
-    }
-  };
-}
-
 export function layer1SponsorshipCheck(job, candidate) {
   const authorization = normalizeSearchText(candidate?.workAuthorization);
   const sponsorshipExempt = SPONSORSHIP_EXEMPT_AUTHORIZATIONS.some((value) => authorization.includes(value));
@@ -338,22 +267,12 @@ export function preFilterAndScore(jobs, candidate, maxPool = PRE_FILTER_POOL_SIZ
   const ranked = [];
   let layer1Discarded = 0;
   let layer1Skipped = 0;
-  let invalidDescriptionDiscarded = 0;
-  const rejectedJobIds = [];
   const candidateSkills = extractAtsSkills(candidate?.masterResume?.text || '');
 
   for (const job of jobs) {
-    const quality = assessJobDescriptionQuality(job);
-    if (!quality.pass) {
-      invalidDescriptionDiscarded += 1;
-      if (job?._id) rejectedJobIds.push(job._id);
-      continue;
-    }
-
     const sponsorship = layer1SponsorshipCheck(job, candidate);
     if (!sponsorship.pass) {
       layer1Discarded += 1;
-      if (job?._id) rejectedJobIds.push(job._id);
       continue;
     }
 
@@ -375,9 +294,7 @@ export function preFilterAndScore(jobs, candidate, maxPool = PRE_FILTER_POOL_SIZ
     totalFetched: jobs.length,
     layer1Passed: ranked.length,
     layer1Discarded,
-    layer1Skipped,
-    invalidDescriptionDiscarded,
-    rejectedJobIds
+    layer1Skipped
   };
 }
 
@@ -484,22 +401,18 @@ You receive one job description and one candidate master resume. Analyze the rol
    Check title-family alignment and core daily work. Functions matter more than exact tools. Equivalent tools count when they prove the same function.
 
 2. Experience fit.
-   Extract JD required years and candidate total professional years. If the JD does not state years, infer a conservative expected baseline from the title, seniority, scope, and responsibilities. Never leave required years unknown or default it mechanically to zero.
-   Apply this formula exactly:
+   Extract JD required years and candidate total professional years. Apply this formula exactly:
    gap = required_years - candidate_years.
-   Pass when -3 <= gap <= 2.
-   A gap below -3 means the candidate is overqualified by more than 3 years and must fail.
-   A gap above 2 means the candidate is underqualified by more than 2 years and must fail.
+   Pass when -2 <= gap <= 2. Fail when gap is outside that range.
 
 3. Sponsorship, authorization, clearance, and location.
    Hard fail for no sponsorship, no visa support, US citizens only, required security clearance, or foreign work authorization the candidate does not have.
-   Pass location only when the role is remote, matches a candidate preferred location, or the resume/profile explicitly proves willingness or ability to work there. Otherwise fail.
+   Location-only onsite/hybrid mismatch is a flag, not a hard fail, because the candidate may relocate.
 
 4. Domain and industry.
-   Pass when the professional function is aligned and any mandatory domain-specific experience is present. A different industry can pass when the work is transferable and the JD does not require prior industry expertise. Otherwise fail.
+   Same or neutral technology domain passes. Different industry but same professional function is a flag, not a hard fail. Hard fail only when the profession itself is wrong.
 
-Every criterion is binary: PASS or FAIL. Do not return flags, review states, partial matches, or conditional passes.
-The portal must list a job only when all 4 criteria pass. If even one criterion fails, the job is disqualified.
+The portal should list a job when at least 3 of the 4 criteria match and there is no hard blocker from sponsorship, clearance, work authorization, or completely wrong profession.
 
 Extract Job DNA for resume tailoring:
 - all_work: core daily work in priority order
@@ -516,17 +429,17 @@ Return only valid JSON with this shape:
   "role_type": "",
   "seniority": "",
   "domain": "",
-  "verdict": "QUALIFIED | DISQUALIFIED",
+  "verdict": "QUALIFIED | PARTIAL_MATCH | DISQUALIFIED",
   "criteria_matched": 0,
   "qualified": false,
   "overall_assessment": "",
   "skills_gap": "None",
   "relatedness_score": 0.0,
   "checkpoints": {
-    "cp1": { "name": "Job Category", "passed": true, "reason": "", "matched_functions": [], "missing_functions": [], "tool_slots": [] },
-    "cp2": { "name": "Experience", "passed": true, "jd_required_years": 0, "jd_years_source": "explicit | inferred", "candidate_years": 0, "gap": 0, "reason": "" },
-    "cp3": { "name": "Sponsorship & Location", "passed": true, "reason": "" },
-    "cp4": { "name": "Domain / Industry", "passed": true, "domain_match": "HIGH | MEDIUM | LOW", "reason": "" }
+    "cp1": { "name": "Job Category", "passed": true, "flag": false, "reason": "", "matched_functions": [], "missing_functions": [], "tool_slots": [] },
+    "cp2": { "name": "Experience", "passed": true, "flag": false, "jd_required_years": 0, "candidate_years": 0, "gap": 0, "reason": "" },
+    "cp3": { "name": "Sponsorship & Location", "passed": true, "flag": false, "hard_blocker": false, "reason": "" },
+    "cp4": { "name": "Domain / Industry", "passed": true, "flag": false, "hard_blocker": false, "domain_match": "HIGH | MEDIUM | LOW", "reason": "" }
   },
   "matched_skills": [],
   "missing_skills": [],
@@ -539,41 +452,16 @@ Return only valid JSON with this shape:
   }
 }`;
 
-function checkpointValue(checkpoint, fallbackName) {
-  return {
-    ...checkpoint,
-    name: checkpoint?.name || fallbackName,
-    passed: checkpoint?.passed === true
-  };
-}
-
-export function normalizeAnalysis(raw, candidate) {
+function normalizeAnalysis(raw) {
   const checkpoints = raw.checkpoints || {};
-  const cp1 = checkpointValue(checkpoints.cp1 || raw.cp1 || {}, 'Job Category');
-  const cp2 = checkpointValue(checkpoints.cp2 || raw.cp2 || {}, 'Experience');
-  const cp3 = checkpointValue(checkpoints.cp3 || raw.cp3 || {}, 'Sponsorship & Location');
-  const cp4 = checkpointValue(checkpoints.cp4 || raw.cp4 || {}, 'Domain / Industry');
-  const requiredYears = Number(cp2.jd_required_years);
-  const candidateYears = Number(candidate?.yearsOfExperience ?? cp2.candidate_years);
+  const cp1 = checkpoints.cp1 || raw.cp1 || {};
+  const cp2 = checkpoints.cp2 || raw.cp2 || {};
+  const cp3 = checkpoints.cp3 || raw.cp3 || {};
+  const cp4 = checkpoints.cp4 || raw.cp4 || {};
 
-  if (Number.isFinite(requiredYears) && requiredYears >= 0 && Number.isFinite(candidateYears) && candidateYears >= 0) {
-    const gap = requiredYears - candidateYears;
-    cp2.jd_required_years = requiredYears;
-    cp2.candidate_years = candidateYears;
-    cp2.gap = gap;
-    cp2.passed = gap >= -MAX_OVERQUALIFIED_YEARS && gap <= MAX_UNDERQUALIFIED_YEARS;
-    if (!cp2.passed) {
-      cp2.reason = gap < -MAX_OVERQUALIFIED_YEARS
-        ? `Candidate is overqualified by ${Math.abs(gap)} years; maximum allowed is ${MAX_OVERQUALIFIED_YEARS}.`
-        : `Candidate is underqualified by ${gap} years; maximum allowed is ${MAX_UNDERQUALIFIED_YEARS}.`;
-    }
-  } else {
-    cp2.passed = false;
-    cp2.reason = 'Experience requirement could not be reliably determined.';
-  }
-
-  const criteria = [cp1, cp2, cp3, cp4].filter((checkpoint) => checkpoint.passed === true).length;
-  const qualified = criteria === 4 && raw.verdict !== 'DISQUALIFIED';
+  const criteria = [cp1, cp2, cp3, cp4].filter((checkpoint) => checkpoint.passed === true || checkpoint.flag === true).length;
+  const hardBlocker = (cp3.passed === false && cp3.flag !== true) || cp3.hard_blocker === true || cp4.hard_blocker === true;
+  const qualified = !hardBlocker && criteria >= 3 && raw.verdict !== 'DISQUALIFIED';
   const relatedness = Number(raw.relatedness_score || 0);
 
   return {
@@ -581,7 +469,7 @@ export function normalizeAnalysis(raw, candidate) {
     checkpoints: { cp1, cp2, cp3, cp4 },
     criteria_matched: criteria,
     qualified,
-    verdict: qualified ? 'QUALIFIED' : 'DISQUALIFIED',
+    verdict: qualified ? (criteria === 4 ? 'QUALIFIED' : 'PARTIAL_MATCH') : 'DISQUALIFIED',
     relatedness_score: Number.isFinite(relatedness) ? relatedness : 0,
     matched_skills: raw.matched_skills || cp1.matched_skills || (cp1.tool_slots || []).filter((tool) => tool.match !== 'MISSING').map((tool) => tool.jd_tool).filter(Boolean),
     missing_skills: raw.missing_skills || cp1.missing_skills || (cp1.tool_slots || []).filter((tool) => tool.match === 'MISSING' && !tool.is_core_requirement).map((tool) => tool.jd_tool).filter(Boolean)
@@ -602,7 +490,7 @@ async function analyzeCandidateJob(candidate, job) {
     ].join('\n')
   });
 
-  return normalizeAnalysis(raw, candidate);
+  return normalizeAnalysis(raw);
 }
 
 function postedDateQuery({ days = 2, dateScope = 'last2d' } = {}) {
@@ -783,26 +671,6 @@ async function cacheAnalysis({ candidate, job, analysis }) {
   );
 }
 
-async function removeUnappliedMatches(candidateId, jobIds) {
-  const ids = [...new Set((jobIds || []).map(String).filter(Boolean))];
-  if (!ids.length) return 0;
-
-  const matches = await Match.find({
-    candidateId,
-    jobId: { $in: ids },
-    status: { $ne: 'applied' }
-  }).select('_id').lean();
-  const matchIds = matches.map((match) => match._id);
-  if (!matchIds.length) return 0;
-
-  await Promise.all([
-    Match.deleteMany({ _id: { $in: matchIds } }),
-    ResumeVersion.updateMany({ matchId: { $in: matchIds } }, { $unset: { matchId: 1 } }),
-    Application.updateMany({ matchId: { $in: matchIds } }, { $unset: { matchId: 1 } })
-  ]);
-  return matchIds.length;
-}
-
 export async function runAiCandidateMatch({
   candidate,
   actor,
@@ -826,7 +694,6 @@ export async function runAiCandidateMatch({
     : query;
   const sourceJobs = await Job.find(sourceQuery).sort({ posted_at: -1, createdAt: -1 }).lean();
   const preFiltered = preFilterAndScore(sourceJobs, candidate, PRE_FILTER_POOL_SIZE);
-  await removeUnappliedMatches(candidate._id, preFiltered.rejectedJobIds);
   const claudePool = preFiltered.jobs;
   const qualified = [];
   let processed = 0;
@@ -837,8 +704,7 @@ export async function runAiCandidateMatch({
 
   console.log(
     `[pre-filter] ${preFiltered.totalFetched} fetched -> `
-    + `${preFiltered.invalidDescriptionDiscarded} invalid descriptions -> `
-    + `${preFiltered.layer1Passed} passed deterministic checks -> `
+    + `${preFiltered.layer1Passed} passed sponsorship -> `
     + `${claudePool.length} sent to Claude`
   );
 
@@ -846,7 +712,6 @@ export async function runAiCandidateMatch({
     totalFetched: preFiltered.totalFetched,
     layer1Passed: preFiltered.layer1Passed,
     layer1Discarded: preFiltered.layer1Discarded,
-    invalidDescriptionDiscarded: preFiltered.invalidDescriptionDiscarded,
     preFilterPoolSize: claudePool.length,
     totalScanned: claudePool.length,
     processed,
@@ -870,7 +735,6 @@ export async function runAiCandidateMatch({
       totalFetched: preFiltered.totalFetched,
       layer1Passed: preFiltered.layer1Passed,
       layer1Discarded: preFiltered.layer1Discarded,
-      invalidDescriptionDiscarded: preFiltered.invalidDescriptionDiscarded,
       preFilterPoolSize: claudePool.length,
       totalScanned: claudePool.length
     };
@@ -888,8 +752,7 @@ export async function runAiCandidateMatch({
       const cachedAnalysis = await AiJobAnalysis.findOne({
         candidateId: candidate._id,
         jobId: job.id,
-        candidateCacheKey: cacheKey,
-        promptVersion: ANALYSIS_PROMPT_VERSION
+        candidateCacheKey: cacheKey
       }).lean();
 
       if (cachedAnalysis?.analysis) {
@@ -915,7 +778,6 @@ export async function runAiCandidateMatch({
     }
 
     if (!analysis.qualified) {
-      await removeUnappliedMatches(candidate._id, [job.id]);
       processed += 1;
       await onProgress?.({
         ...commonProgress,
@@ -990,7 +852,6 @@ export async function runAiCandidateMatch({
     totalFetched: preFiltered.totalFetched,
     layer1Passed: preFiltered.layer1Passed,
     layer1Discarded: preFiltered.layer1Discarded,
-    invalidDescriptionDiscarded: preFiltered.invalidDescriptionDiscarded,
     preFilterPoolSize: claudePool.length,
     qualifiedByClaude: qualified.length,
     totalScanned: claudePool.length,
@@ -1001,7 +862,7 @@ export async function runAiCandidateMatch({
     dateScope: normalizedDateScope,
     titleKeywords: selectedKeywords,
     aiModel: env.anthropicAnalysisModel,
-    criteriaRequired: 4,
+    criteriaRequired: 3,
     finalLimit: MAX_FINAL_RESULTS
   };
 }
@@ -1021,7 +882,6 @@ export async function prepareCandidateMatchWorkflow({
       totalFetched: 0,
       layer1Passed: 0,
       layer1Discarded: 0,
-      invalidDescriptionDiscarded: 0,
       days,
       dateScope,
       titleKeywords
@@ -1038,7 +898,6 @@ export async function prepareCandidateMatchWorkflow({
     : plan.query;
   const sourceJobs = await Job.find(sourceQuery).sort({ posted_at: -1, createdAt: -1 }).lean();
   const preFiltered = preFilterAndScore(sourceJobs, candidate, PRE_FILTER_POOL_SIZE);
-  await removeUnappliedMatches(candidate._id, preFiltered.rejectedJobIds);
   const jobs = preFiltered.jobs.map(({ rawJob, preFilter }, index) => ({
     jobId: String(rawJob._id),
     preFilter,
@@ -1051,7 +910,6 @@ export async function prepareCandidateMatchWorkflow({
     totalFetched: preFiltered.totalFetched,
     layer1Passed: preFiltered.layer1Passed,
     layer1Discarded: preFiltered.layer1Discarded,
-    invalidDescriptionDiscarded: preFiltered.invalidDescriptionDiscarded,
     preFilterPoolSize: jobs.length,
     totalScanned: jobs.length,
     days: plan.days,
@@ -1062,8 +920,7 @@ export async function prepareCandidateMatchWorkflow({
 
   console.log(
     `[pre-filter] ${preFiltered.totalFetched} fetched -> `
-    + `${preFiltered.invalidDescriptionDiscarded} invalid descriptions -> `
-    + `${preFiltered.layer1Passed} passed deterministic checks -> `
+    + `${preFiltered.layer1Passed} passed sponsorship -> `
     + `${jobs.length} sent to Claude`
   );
 
@@ -1072,7 +929,6 @@ export async function prepareCandidateMatchWorkflow({
     totalFetched: preFiltered.totalFetched,
     layer1Passed: preFiltered.layer1Passed,
     layer1Discarded: preFiltered.layer1Discarded,
-    invalidDescriptionDiscarded: preFiltered.invalidDescriptionDiscarded,
     days: plan.days,
     dateScope: plan.dateScope,
     titleKeywords: plan.titleKeywords
@@ -1120,8 +976,7 @@ export async function processCandidateMatchWorkflowJob({
     const cachedAnalysis = await AiJobAnalysis.findOne({
       candidateId,
       jobId,
-      candidateCacheKey: candidateCacheKey(candidate),
-      promptVersion: ANALYSIS_PROMPT_VERSION
+      candidateCacheKey: candidateCacheKey(candidate)
     }).lean();
 
     if (cachedAnalysis?.analysis) {
@@ -1142,8 +997,6 @@ export async function processCandidateMatchWorkflowJob({
         preFilterRank
       });
       matched = 1;
-    } else {
-      await removeUnappliedMatches(candidateId, [jobId]);
     }
   } catch (error) {
     failed = 1;
@@ -1214,7 +1067,6 @@ export async function finalizeCandidateMatchWorkflow({ runId, candidateId, actor
       totalFetched: run.totalFetched,
       layer1Passed: run.layer1Passed,
       layer1Discarded: run.layer1Discarded,
-      invalidDescriptionDiscarded: run.invalidDescriptionDiscarded,
       preFilterPoolSize: run.preFilterPoolSize,
       cancelled,
       cached: run.cached,

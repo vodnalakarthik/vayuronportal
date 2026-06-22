@@ -17,7 +17,6 @@ const matchRunSchema = new mongoose.Schema(
     totalFetched: { type: Number, default: 0 },
     layer1Passed: { type: Number, default: 0 },
     layer1Discarded: { type: Number, default: 0 },
-    invalidDescriptionDiscarded: { type: Number, default: 0 },
     preFilterPoolSize: { type: Number, default: 0 },
     qualifiedByClaude: { type: Number, default: 0 },
     totalScanned: { type: Number, default: 0 },
