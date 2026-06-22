@@ -1882,8 +1882,9 @@ function CandidateDetail({ id, onUpdated }) {
           </div>
           <div className="ai-run-meta">
             <span>{matchRun.totalFetched || 0} fetched</span>
-            <span>{matchRun.layer1Passed || 0} sponsorship-safe</span>
-            <span>{matchRun.layer1Discarded || 0} blocked</span>
+            <span>{matchRun.layer1Passed || 0} pre-filtered</span>
+            <span>{matchRun.layer1Discarded || 0} authorization-blocked</span>
+            <span>{matchRun.invalidDescriptionDiscarded || 0} invalid descriptions</span>
             <span>{matchRun.preFilterPoolSize || matchRun.totalScanned || 0} sent to Claude</span>
             <span>{matchRun.processed || 0}/{matchRun.totalScanned || 0} analyzed</span>
             <span>{matchRun.matched || 0} matched</span>
@@ -1973,7 +1974,7 @@ function CandidateDetail({ id, onUpdated }) {
                   <div className="analysis-bar">
                     <div className="analysis-bar-main">
                       <StatusPill tone={verdict === 'QUALIFIED' ? 'green' : 'gold'}>{verdict || 'AI match'}</StatusPill>
-                      <span>{criteriaMatched || 3}/4 criteria</span>
+                      <span>{criteriaMatched ?? 4}/4 criteria</span>
                       {Number.isFinite(match.preFilterScore) ? (
                         <span>ATS {match.preFilterScore}%{match.preFilterRank ? ` · pre-rank #${match.preFilterRank}` : ''}</span>
                       ) : null}
@@ -1993,7 +1994,7 @@ function CandidateDetail({ id, onUpdated }) {
                         <div className="checkpoint-bars">
                           {checkpointRows.map(({ key, label, checkpoint }) => {
                             const checkpointKey = `${matchKey}:${key}`;
-                            const passed = checkpoint.passed === true || checkpoint.flag === false;
+                            const passed = checkpoint.passed === true;
                             const isCheckpointOpen = Boolean(expandedCheckpoints[checkpointKey]);
                             const checkpointTitle = checkpoint.name || label;
                             return (
@@ -2004,9 +2005,9 @@ function CandidateDetail({ id, onUpdated }) {
                                   onClick={() => toggleCheckpoint(matchKey, key)}
                                 >
                                   <span>{checkpointTitle}</span>
-                                  <strong>{passed ? 'Pass' : 'Review'}</strong>
+                                  <strong>{passed ? 'Pass' : 'Fail'}</strong>
                                 </button>
-                                {isCheckpointOpen ? <small>{checkpoint.reason || 'Reviewed by AI.'}</small> : null}
+                                {isCheckpointOpen ? <small>{checkpoint.reason || 'Evaluated by AI.'}</small> : null}
                               </div>
                             );
                           })}
@@ -2024,7 +2025,7 @@ function CandidateDetail({ id, onUpdated }) {
                       ) : null}
                       {missingSkills.length ? (
                         <div className="match-skill-block muted-skills">
-                          <small>Skills to review</small>
+                          <small>Missing skills</small>
                           <div className="skill-row">
                             {missingSkills.slice(0, 6).map((skill) => (
                               <span key={skill}>{skill}</span>

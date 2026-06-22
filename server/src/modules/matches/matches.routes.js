@@ -73,7 +73,13 @@ matchesRouter.get('/candidates/:candidateId/runs/latest', async (req, res, next)
 matchesRouter.get('/candidates/:candidateId', async (req, res, next) => {
   try {
     await findAccessibleCandidate(req.params.candidateId, req.user, { lean: true });
-    const matches = await Match.find({ candidateId: req.params.candidateId }).sort({ score: -1 }).lean();
+    const matches = await Match.find({
+      candidateId: req.params.candidateId,
+      $or: [
+        { aiProvider: { $ne: 'anthropic' } },
+        { aiProvider: 'anthropic', criteriaMatched: 4, verdict: 'QUALIFIED' }
+      ]
+    }).sort({ score: -1 }).lean();
     res.json({ matches });
   } catch (error) {
     next(error);
