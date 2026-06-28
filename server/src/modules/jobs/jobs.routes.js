@@ -292,10 +292,11 @@ jobsRouter.get('/', async (req, res, next) => {
     const selectedSort = allowedSorts.has(String(sortBy)) ? sortFieldMap[String(sortBy)] || String(sortBy) : 'createdAt';
     const pageNumber = Math.max(1, Number(page));
     const limitNumber = Math.min(100, Math.max(1, Number(limit)));
+    const sortDirection = sortDir === 'asc' ? 1 : -1;
 
     const [jobs, total] = await Promise.all([
       Job.find(query)
-        .sort({ [selectedSort]: sortDir === 'asc' ? 1 : -1 })
+        .sort({ [selectedSort]: sortDirection, _id: sortDirection })
         .skip((pageNumber - 1) * limitNumber)
         .limit(limitNumber)
         .lean(),
